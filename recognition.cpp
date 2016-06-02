@@ -19,6 +19,12 @@
 #include <chrono>
 #include <boost/format.hpp>
 
+#include "define.h"
+#include "Sampling.h"
+#include <pcl/filters/statistical_outlier_removal.h>
+#include "Ppfe.h"
+#include "Icp.h"
+
 
 #define FPS_CALC_BEGIN                          \
     static double duration = 0;                 \
@@ -80,6 +86,7 @@ class LibRealSenseRecognition
     , use_fixed_scene_ (use_fixed_scene)
     , scene_filename_ (scene_filename)
     {
+      icp_iteration_ = 10;
       //
       //  Load model clouds
       //
@@ -120,18 +127,41 @@ class LibRealSenseRecognition
         std::cout << "Clustering bin size:    " << cg_size_ << std::endl << std::endl;
       }
       
-      //  Compute Model Normals
-      model_normals_.reset (new pcl::PointCloud<NormalType>);
-      normalEstimation (model_, *model_normals_);
-     
-      //  Downsample Clouds to Extract Model keypoints
-      model_keypoints_.reset (new Cloud);
-      extractKeyPoint (model_, *model_keypoints_, model_ss_);
-      std::cout << "Model total points: " << model_->size () << "; Selected Keypoints: " << model_keypoints_->size () << std::endl;
+      // Add the model to the filter so that the scene can be filtered using the model mean color
+      if (to_filter)
+      {
+        filter_ = new ColorSampling(filter_intensity);
+        filter_->AddCloud (*model_);
+      }
 
-      //  Compute Model Descriptor for Model keypoints
-      model_descriptors_.reset (new pcl::PointCloud<DescriptorType>);
-      computeDescriptor (model_, model_keypoints_, model_normals_, *model_descriptors_);
+      // Remove outliers to clean the scene from sparse points
+      if (remove_outliers)
+      {
+        sor_ = new pcl::StatisticalOutlierRemoval < PointType >();
+        sor_->setMeanK (50);
+        sor_->setStddevMulThresh (0.5);
+      }
+      // Calculate the model keypoints using the specified method
+      if (ppfe)
+      {
+        ppfe_estimator_ = new Ppfe(model_);
+        model_keypoints_ = ppfe_estimator_->GetModelKeypoints ();    
+      }
+      else
+      {
+        //  Compute Model Normals
+        model_normals_.reset (new pcl::PointCloud<NormalType>);
+        normalEstimation (model_, *model_normals_);
+     
+        //  Downsample Clouds to Extract Model keypoints
+        model_keypoints_.reset (new Cloud);
+        extractKeyPoint (model_, *model_keypoints_, model_ss_);
+        std::cout << "Model total points: " << model_->size () << "; Selected Keypoints: " << model_keypoints_->size () << std::endl;
+
+        //  Compute Model Descriptor for Model keypoints
+        model_descriptors_.reset (new pcl::PointCloud<DescriptorType>);
+        computeDescriptor (model_, model_keypoints_, model_normals_, *model_descriptors_);
+      }
     }
 
     //Return back averaging distance between each point and its nearest neighbor 
@@ -283,6 +313,23 @@ class LibRealSenseRecognition
           if (!viz.updatePointCloud (rotated_model, rotated_model_color_handler, ss_cloud.str ()))
             viz.addPointCloud (rotated_model, rotated_model_color_handler, ss_cloud.str ());
         }
+        if (rototranslations_.size () == 0)
+        {
+          RefCloudPtr rotated_model (new RefCloud ());
+
+          std::stringstream ss_cloud;
+          ss_cloud << "instance" << 0;
+
+          pcl::visualization::PointCloudColorHandlerCustom<PointType> rotated_model_color_handler (rotated_model, 255, 0, 0);
+          if (!viz.updatePointCloud (rotated_model, rotated_model_color_handler, ss_cloud.str ()))
+            viz.addPointCloud (rotated_model, rotated_model_color_handler, ss_cloud.str ());
+        }
+        auto end_time = std::chrono::high_resolution_clock::now ();
+        fps_ = std::chrono::duration<float> (end_time - begin_time_).count ();
+        // draw some texts
+        viz.removeShape ("FPS");
+        viz.addText ((boost::format ("Object Recognition: %f fps") % (1.0 / fps_)).str (),
+                     10, 20, 20, 1.0, 1.0, 1.0, "FPS");
       }
       new_cloud_ = false;
     }
@@ -291,6 +338,7 @@ class LibRealSenseRecognition
     cloud_cb (const CloudConstPtr &cloud)
     {
       boost::mutex::scoped_lock lock (mtx_);
+      begin_time_ = std::chrono::high_resolution_clock::now ();
       //CloudPtr scene (new Cloud ());
       CloudPtr scene_keypoints (new Cloud ());
       pcl::PointCloud<NormalType>::Ptr scene_normals (new pcl::PointCloud<NormalType> ());
@@ -305,127 +353,195 @@ class LibRealSenseRecognition
       {
         filterPassThrough (cloud, *cloud_pass_);
       }
+      int reducedPoint = cloud_pass_->size ();
+
+      // Delete the main plane to reduce the number of points in the scene point cloud
+      if (segment)
+        cloud_pass_ = FindAndSubtractPlane (cloud_pass_, segmentation_threshold, segmentation_iterations);
+
+      // Filter the scene using the mean model color calculated before
+      if (to_filter)
+      {
+        filter_->FilterPointCloud (*cloud_pass_, *cloud_pass_);
+      }
+      // Remove outliers from the scene to avoid sparse points
+      if (remove_outliers)
+      {
+        sor_->setInputCloud (cloud_pass_);
+        sor_->filter (*cloud_pass_);
+      }
+      reducedPoint = reducedPoint - cloud_pass_->size ();
       std::cout << "cloud_pass: " << cloud_pass_->size () << std::endl;
-      normalEstimation (cloud_pass_, *scene_normals);
+      std::cout << "Reduced Point: " << reducedPoint << std::endl;
+      if (ppfe)
+      {
+        // PPFE
+        float time = 0;
+        auto t0 = std::chrono::high_resolution_clock::now ();
+        cluster_ = ppfe_estimator_->GetCluster (cloud_pass_);
+        scene_keypoints_ = ppfe_estimator_->GetSceneKeypoints ();
+        show_correspondences_ = false;
+        std::cout << "\tFound " << std::get < 0 > (cluster_).size () << " model instance/instances " << std::endl;
+
+        if(std::get < 0 > (cluster_).size () > 0 && cloud_pass_->size () != 0)
+        {
+          if(use_icp)
+          {
+            //pcl::PointCloud<PointType>::Ptr rotated_model (new pcl::PointCloud<PointType> ());
+            CloudPtr rotated_model (new Cloud ());
+            std::cout << "\t USING ICP"<<std::endl;
+            pcl::transformPointCloud (*model_, *rotated_model, (std::get < 0 > (cluster_)[0]));
+            Eigen::Matrix4f tmp = Eigen::Matrix4f::Identity();
+            if (cloud_pass_->size ()*5 > rotated_model->size ())
+              for(int i = 0; i< icp_iteration_; ++i)
+              {
+                //while(!icp.HasConverged()){
+                icp_.Align (rotated_model, cloud_pass_);
+                tmp = icp_.transformation_ * tmp;  
+              }
+            std::get < 0 > (cluster_)[0] =  tmp * std::get < 0 > (cluster_)[0];
+            std::cout << "\nICP has converged " << icp_.HasConverged () << ", score is " << icp_.fitness_score_ << std::endl;
+            /*if(error_log)
+              e.WriteError(icp.transformation_, icp.fitness_score_, id, elapsed, frame_index);*/
+          }
+          rototranslations_ = std::get < 0 > (cluster_);
+          //found_models[id] = cluster; 
+        }
+        auto t1 = std::chrono::high_resolution_clock::now ();
+        time = std::chrono::duration<float> (t1 - t0).count ();
+        printf("ICP time duration is %.4f\n",time);
+      }
+      else
+      {
+        normalEstimation (cloud_pass_, *scene_normals);
       
-      extractKeyPoint (cloud_pass_, *scene_keypoints, scene_ss_);
+        extractKeyPoint (cloud_pass_, *scene_keypoints, scene_ss_);
+        float time = 0;
+        auto t0 = std::chrono::high_resolution_clock::now ();
+        computeDescriptor (cloud_pass_, scene_keypoints, scene_normals, *scene_descriptors);
+        std::cout << "Scene Keypoints size: " << scene_keypoints->size () << std::endl;
+        std::cout << "Reduced Point: " << reducedPoint << std::endl;
+        std::cout << "Initial process done" << std::endl;
+        auto t1 = std::chrono::high_resolution_clock::now ();
+        time = std::chrono::duration<float> (t1 - t0).count ();
+        printf("Load clouds time duration is %.4f\n",time);
+        t0=t1;
+        //
+        //  Find Model-Scene Correspondences with KdTree
+        //
+        pcl::CorrespondencesPtr model_scene_corrs (new pcl::Correspondences ());
+
+        pcl::KdTreeFLANN<DescriptorType> match_search;
+        match_search.setInputCloud (model_descriptors_);
+        //  For each scene keypoint descriptor, find nearest neighbor into the model keypoints descriptor cloud and add it to the correspondences vector.
+        for (size_t i = 0; i < scene_descriptors->size (); ++i)
+        {
+          std::vector<int> neigh_indices (1);
+          std::vector<float> neigh_sqr_dists (1);
+          if (!pcl_isfinite (scene_descriptors->at (i).descriptor[0])) //skipping NaNs
+          {
+            continue;
+          }
+          //Searching domain is model_descr, point is scene)descr point, only find the nearest point, store its indice and dist
+          int found_neighs = match_search.nearestKSearch (scene_descriptors->at (i), 1, neigh_indices, neigh_sqr_dists);
+          if (found_neighs == 1 && neigh_sqr_dists[0] < 0.25f) //  add match only if the squared descriptor distance is less than 0.25 (SHOT descriptor distances are between 0 and 1 by design)
+          {
+            //corr between model indice and scene indice
+            pcl::Correspondence corr (neigh_indices[0], static_cast<int> (i), neigh_sqr_dists[0]);
+            model_scene_corrs->push_back (corr);
+          }
+        }
+
+        t1 = std::chrono::high_resolution_clock::now ();
+        time = std::chrono::duration<float> (t1 - t0).count ();
+        printf("Find Model_scene time duration is %.4f\n",time);
+        t0=t1;
+        std::cout << "Correspondences found: " << model_scene_corrs->size () << std::endl;
+        //
+        //  Actual Clustering
+        //
+        //std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f> > rototranslations;
+        std::vector<pcl::Correspondences> clustered_corrs;
+        rototranslations_.clear ();
+        //  Using Hough3D
+        if (use_hough_)
+        {
+          //
+          //  Compute (Keypoints) Reference Frames only for Hough
+          //
+          pcl::PointCloud<RFType>::Ptr model_rf (new pcl::PointCloud<RFType> ());
+          pcl::PointCloud<RFType>::Ptr scene_rf (new pcl::PointCloud<RFType> ());
+
+          pcl::BOARDLocalReferenceFrameEstimation<PointType, NormalType, RFType> rf_est;
+          rf_est.setFindHoles (true);
+          rf_est.setRadiusSearch (rf_rad_);
+
+          rf_est.setInputCloud (model_keypoints_);
+          rf_est.setInputNormals (model_normals_);
+          rf_est.setSearchSurface (model_);
+          rf_est.compute (*model_rf);
+
+          rf_est.setInputCloud (scene_keypoints);
+          rf_est.setInputNormals (scene_normals);
+          rf_est.setSearchSurface (cloud_pass_);
+          rf_est.compute (*scene_rf);
+
+          //  Clustering
+          pcl::Hough3DGrouping<PointType, PointType, RFType, RFType> clusterer;
+          clusterer.setHoughBinSize (cg_size_);
+          clusterer.setHoughThreshold (cg_thresh_);
+          clusterer.setUseInterpolation (true);
+          clusterer.setUseDistanceWeight (false);
+
+          clusterer.setInputCloud (model_keypoints_);
+          clusterer.setInputRf (model_rf);
+          clusterer.setSceneCloud (scene_keypoints);
+          clusterer.setSceneRf (scene_rf);
+          clusterer.setModelSceneCorrespondences (model_scene_corrs);
+
+          clusterer.recognize (rototranslations_, clustered_corrs);
+        }
+        else //  Using GeometricConsistency
+        {
+          pcl::GeometricConsistencyGrouping<PointType, PointType> gc_clusterer;
+          gc_clusterer.setGCSize (cg_size_);
+          gc_clusterer.setGCThreshold (cg_thresh_);
+
+          gc_clusterer.setInputCloud (model_keypoints_);
+          gc_clusterer.setSceneCloud (scene_keypoints);
+          gc_clusterer.setModelSceneCorrespondences (model_scene_corrs);
+
+          gc_clusterer.recognize (rototranslations_, clustered_corrs);
+        }
+        //
+        //  Output results
+        //
+        std::cout << "Model instances found: " << rototranslations_.size () << std::endl;
+        for (size_t i = 0; i < rototranslations_.size (); ++i)
+        {
+          std::cout << "\n    Instance " << i + 1 << ":" << std::endl;
+          std::cout << "        Correspondences belonging to this instance: " << clustered_corrs[i].size () << std::endl;
+
+          // Print the rotation matrix and translation vector
+          Eigen::Matrix3f rotation = rototranslations_[i].block<3,3>(0, 0);
+          Eigen::Vector3f translation = rototranslations_[i].block<3,1>(0, 3);
+
+          printf ("\n");
+          printf ("            | %6.3f %6.3f %6.3f | \n", rotation (0,0), rotation (0,1), rotation (0,2));
+          printf ("        R = | %6.3f %6.3f %6.3f | \n", rotation (1,0), rotation (1,1), rotation (1,2));
+          printf ("            | %6.3f %6.3f %6.3f | \n", rotation (2,0), rotation (2,1), rotation (2,2));
+          printf ("\n");
+          printf ("        t = < %0.3f, %0.3f, %0.3f >\n", translation (0), translation (1), translation (2));
+        }
+        scene_keypoints_ = scene_keypoints;
+      }
       float time = 0;
       auto t0 = std::chrono::high_resolution_clock::now ();
-      computeDescriptor (cloud_pass_, scene_keypoints, scene_normals, *scene_descriptors);
-      std::cout << "Scene Keypoints size: " << scene_keypoints->size () << std::endl;
-      std::cout << "Initial process done" << std::endl;
+      filterPassThrough (cloud, *cloud_pass_);
       auto t1 = std::chrono::high_resolution_clock::now ();
       time = std::chrono::duration<float> (t1 - t0).count ();
-      printf("Load clouds time duration is %.4f\n",time);
+      printf("filterPassThrough time duration is %.4f\n",time);
       t0=t1;
-      //
-      //  Find Model-Scene Correspondences with KdTree
-      //
-      pcl::CorrespondencesPtr model_scene_corrs (new pcl::Correspondences ());
-
-      pcl::KdTreeFLANN<DescriptorType> match_search;
-      match_search.setInputCloud (model_descriptors_);
-      //  For each scene keypoint descriptor, find nearest neighbor into the model keypoints descriptor cloud and add it to the correspondences vector.
-      for (size_t i = 0; i < scene_descriptors->size (); ++i)
-      {
-      	std::vector<int> neigh_indices (1);
-      	std::vector<float> neigh_sqr_dists (1);
-      	if (!pcl_isfinite (scene_descriptors->at (i).descriptor[0])) //skipping NaNs
-        {
-          continue;
-        }
-        //Searching domain is model_descr, point is scene)descr point, only find the nearest point, store its indice and dist
-        int found_neighs = match_search.nearestKSearch (scene_descriptors->at (i), 1, neigh_indices, neigh_sqr_dists);
-        if(found_neighs == 1 && neigh_sqr_dists[0] < 0.25f) //  add match only if the squared descriptor distance is less than 0.25 (SHOT descriptor distances are between 0 and 1 by design)
-        {
-          //corr between model indice and scene indice
-          pcl::Correspondence corr (neigh_indices[0], static_cast<int> (i), neigh_sqr_dists[0]);
-          model_scene_corrs->push_back (corr);
-        }
-      }
-
-      t1 = std::chrono::high_resolution_clock::now ();
-      time = std::chrono::duration<float> (t1 - t0).count ();
-      printf("Find Model_scene time duration is %.4f\n",time);
-      t0=t1;
-      std::cout << "Correspondences found: " << model_scene_corrs->size () << std::endl;
-      //
-      //  Actual Clustering
-      //
-      //std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f> > rototranslations;
-      std::vector<pcl::Correspondences> clustered_corrs;
-      rototranslations_.clear ();
-      //  Using Hough3D
-      if (use_hough_)
-      {
-        //
-        //  Compute (Keypoints) Reference Frames only for Hough
-        //
-        pcl::PointCloud<RFType>::Ptr model_rf (new pcl::PointCloud<RFType> ());
-        pcl::PointCloud<RFType>::Ptr scene_rf (new pcl::PointCloud<RFType> ());
-
-        pcl::BOARDLocalReferenceFrameEstimation<PointType, NormalType, RFType> rf_est;
-        rf_est.setFindHoles (true);
-        rf_est.setRadiusSearch (rf_rad_);
-
-        rf_est.setInputCloud (model_keypoints_);
-        rf_est.setInputNormals (model_normals_);
-        rf_est.setSearchSurface (model_);
-        rf_est.compute (*model_rf);
-
-        rf_est.setInputCloud (scene_keypoints);
-        rf_est.setInputNormals (scene_normals);
-        rf_est.setSearchSurface (cloud_pass_);
-        rf_est.compute (*scene_rf);
-
-        //  Clustering
-        pcl::Hough3DGrouping<PointType, PointType, RFType, RFType> clusterer;
-        clusterer.setHoughBinSize (cg_size_);
-        clusterer.setHoughThreshold (cg_thresh_);
-        clusterer.setUseInterpolation (true);
-        clusterer.setUseDistanceWeight (false);
-
-        clusterer.setInputCloud (model_keypoints_);
-        clusterer.setInputRf (model_rf);
-        clusterer.setSceneCloud (scene_keypoints);
-        clusterer.setSceneRf (scene_rf);
-        clusterer.setModelSceneCorrespondences (model_scene_corrs);
-
-        clusterer.recognize (rototranslations_, clustered_corrs);
-      }
-      else //  Using GeometricConsistency
-      {
-        pcl::GeometricConsistencyGrouping<PointType, PointType> gc_clusterer;
-        gc_clusterer.setGCSize (cg_size_);
-        gc_clusterer.setGCThreshold (cg_thresh_);
-
-        gc_clusterer.setInputCloud (model_keypoints_);
-        gc_clusterer.setSceneCloud (scene_keypoints);
-        gc_clusterer.setModelSceneCorrespondences (model_scene_corrs);
-
-        gc_clusterer.recognize (rototranslations_, clustered_corrs);
-      }
-      //
-      //  Output results
-      //
-      std::cout << "Model instances found: " << rototranslations_.size () << std::endl;
-      for (size_t i = 0; i < rototranslations_.size (); ++i)
-      {
-        std::cout << "\n    Instance " << i + 1 << ":" << std::endl;
-        std::cout << "        Correspondences belonging to this instance: " << clustered_corrs[i].size () << std::endl;
-
-        // Print the rotation matrix and translation vector
-        Eigen::Matrix3f rotation = rototranslations_[i].block<3,3>(0, 0);
-        Eigen::Vector3f translation = rototranslations_[i].block<3,1>(0, 3);
-
-        printf ("\n");
-        printf ("            | %6.3f %6.3f %6.3f | \n", rotation (0,0), rotation (0,1), rotation (0,2));
-        printf ("        R = | %6.3f %6.3f %6.3f | \n", rotation (1,0), rotation (1,1), rotation (1,2));
-        printf ("            | %6.3f %6.3f %6.3f | \n", rotation (2,0), rotation (2,1), rotation (2,2));
-        printf ("\n");
-        printf ("        t = < %0.3f, %0.3f, %0.3f >\n", translation (0), translation (1), translation (2));
-      }
-      scene_keypoints_ = scene_keypoints;
       new_cloud_ = true;
     }
 
@@ -454,6 +570,11 @@ class LibRealSenseRecognition
     pcl::PointCloud<NormalType>::Ptr model_normals_;
     pcl::PointCloud<DescriptorType>::Ptr model_descriptors_;
     std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f> > rototranslations_;
+    ColorSampling *filter_;
+    pcl::StatisticalOutlierRemoval < PointType > *sor_;
+    Ppfe *ppfe_estimator_;
+    ClusterType cluster_;
+    ICP icp_;
 
     pcl::visualization::CloudViewer viewer_;
     std::string device_id_;
@@ -474,19 +595,27 @@ class LibRealSenseRecognition
     float cg_size_;
     float cg_thresh_;
 
+    float fps_;
+    std::chrono::high_resolution_clock::time_point begin_time_;
+    int icp_iteration_;
+
 };
 
 void
-usage (char* argv)
+usage (char** argv)
 {
   std::cout << std::endl;
   std::cout << "***************************************************************************" << std::endl;
   std::cout << "*                                                                         *" << std::endl;
-  std::cout << "*                   Recognition Tutorial - Usage Guide                    *" << std::endl;
-  std::cout << "*                        for RealSense Camera Only                        *" << std::endl;
+  std::cout << "*                   LibRealSense Recognition - Usage Guide                *" << std::endl;
+  std::cout << "*                                                                         *" << std::endl;
   std::cout << "***************************************************************************" << std::endl << std::endl;	
   std::cout << "usage: " << argv[0] << " <device_id> model_filename.pcd [Options]" << std::endl << std::endl;
   std::cout << "     -k:                          Show used keypoints." << std::endl;
+  std::cout << "     -segment:                    Delete the main plane to reduce the number of points in the scene point cloud." << std::endl;
+  std::cout << "     -filter                      Filter the cloud by color leaving only the points which are close to the model color." << std::endl;
+  std::cout << "     -remove_outliers             Remove ouliers from the scene." << std::endl;
+  std::cout << "     -ppfe:                       Use Ppfe for object recognition, if you turn this on, parameters below will be useless." << std::endl;
   std::cout << "     -r:                          Compute the model cloud resolution and multiply" << std::endl;
   std::cout << "                                  each radius given by that value." << std::endl;
   std::cout << "     --algorithm (Hough|GC):      Clustering algorithm used (default Hough)." << std::endl;
@@ -502,17 +631,17 @@ usage (char* argv)
 int
 main (int argc, char** argv)
 {
-  bool show_keypoints = false;
+  /*bool use_cloud_resolution = false;
+  bool use_fixed_scene =false;*/
+  /*bool show_keypoints = false;
   bool show_correspondences = false;
-  bool use_cloud_resolution = false;
   bool use_hough = true;
-  bool use_fixed_scene =false;
   float model_ss = 0.01f;
   float scene_ss = 0.03f;
   float rf_rad = 0.015f;
   float descr_rad = 0.02f;
   float cg_size = 0.01f;
-  float cg_thresh = 5.0f;
+  float cg_thresh = 5.0f;*/
   std::vector<int> filenames;
   filenames = pcl::console::parse_file_extension_argument (argc, argv, ".pcd");
   if (pcl::console::find_switch (argc, argv, "-k") || pcl::console::find_switch (argc, argv, "-K"))
@@ -526,6 +655,22 @@ main (int argc, char** argv)
   if (pcl::console::find_switch (argc, argv, "-r") || pcl::console::find_switch (argc, argv, "-R"))
   {
     use_cloud_resolution = true;
+  }
+  if (pcl::console::find_switch (argc, argv, "-segment"))
+  {
+    segment = true;
+  }
+  if (pcl::console::find_switch (argc, argv, "-filter"))
+  {
+    to_filter = true;
+  }
+  if (pcl::console::find_switch (argc, argv, "-ppfe"))
+  {
+    ppfe = true;
+  }
+  if (pcl::console::find_switch (argc, argv, "-remove_outliers"))
+  {
+    remove_outliers = true;
   }
 
   std::string used_algorithm;
@@ -541,7 +686,7 @@ main (int argc, char** argv)
     else
     {
       std::cout << "Wrong algorithm name.\n";
-      usage (argv[0]);
+      usage (argv);
       exit (-1);
     }
   }
@@ -564,7 +709,7 @@ main (int argc, char** argv)
   if (filenames.size () < 1)
   {
     std::cout << "Filenames missing.\n";
-    usage (argv[0]);
+    usage (argv);
     exit (-1);
   }
   std::string model_filename = argv[filenames[0]];
